@@ -168,7 +168,7 @@ internal sealed class Preview3DViewModel : INotifyPropertyChanged, ITimelineTool
 
     // ── IToolViewModel ──
 
-    public string? Title => "3Dプレビュー";
+    public string? Title => "簡単3Dプレビュー";
 
     public event EventHandler<CreateNewToolViewRequestedEventArgs>? CreateNewToolViewRequested;
 
