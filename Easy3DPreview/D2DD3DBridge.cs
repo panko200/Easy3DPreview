@@ -34,18 +34,26 @@ internal static class D2DD3DBridge
             };
 
             var texture = devices.D3D.Device.CreateTexture2D(texDesc);
-            using var surface = texture.QueryInterface<IDXGISurface>();
+            try
+            {
+                using var surface = texture.QueryInterface<IDXGISurface>();
 
-            float dpiX = devices.DeviceContext.Dpi.Width;
-            float dpiY = devices.DeviceContext.Dpi.Height;
+                float dpiX = devices.DeviceContext.Dpi.Width;
+                float dpiY = devices.DeviceContext.Dpi.Height;
 
-            var bitmapProps = new BitmapProperties1(
-                new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
-                dpiX, dpiY, BitmapOptions.Target
-            );
+                var bitmapProps = new BitmapProperties1(
+                    new Vortice.DCommon.PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
+                    dpiX, dpiY, BitmapOptions.Target
+                );
 
-            var bitmap = devices.DeviceContext.CreateBitmapFromDxgiSurface(surface, bitmapProps);
-            return (texture, bitmap);
+                var bitmap = devices.DeviceContext.CreateBitmapFromDxgiSurface(surface, bitmapProps);
+                return (texture, bitmap);
+            }
+            catch
+            {
+                texture?.Dispose();
+                throw;
+            }
         }
         catch { return null; }
     }
@@ -69,6 +77,12 @@ internal static class D2DD3DBridge
                 dc.Clear(new Color4(0f, 0f, 0f, 0f));
                 dc.DrawImage(image, new Vector2(offsetX, offsetY), null, InterpolationMode.Linear, CompositeMode.SourceOver);
                 dc.EndDraw();
+                return texture;
+            }
+            catch
+            {
+                texture?.Dispose();
+                throw;
             }
             finally
             {
@@ -76,8 +90,6 @@ internal static class D2DD3DBridge
                 dc.Target = prevTarget;
                 bitmap.Dispose();
             }
-
-            return texture;
         }
         catch { return null; }
     }

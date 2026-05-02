@@ -59,6 +59,24 @@ internal static class Preview3DPatch
     // ── 最新キャプチャ結果（スレッドセーフに交換） ──
     private static readonly object _lock = new();
     private static CapturedFrame? _latestFrame;
+    private static int _captureConsumers = 0;
+
+    public static void RegisterConsumer()
+    {
+        System.Threading.Interlocked.Increment(ref _captureConsumers);
+    }
+
+    public static void UnregisterConsumer()
+    {
+        if (System.Threading.Interlocked.Decrement(ref _captureConsumers) <= 0)
+        {
+            lock (_lock)
+            {
+                _latestFrame?.Dispose();
+                _latestFrame = null;
+            }
+        }
+    }
 
     /// <summary>
     /// 最新のキャプチャ結果を取得（呼び出し側が Dispose 責任を持つ）。
@@ -125,6 +143,8 @@ internal static class Preview3DPatch
 
     private static void UpdatePostfix(object __instance)
     {
+        if (System.Threading.Volatile.Read(ref _captureConsumers) <= 0) return;
+
         try
         {
             var devices = _devicesField!.GetValue(__instance) as IGraphicsDevicesAndContext;
@@ -135,81 +155,101 @@ internal static class Preview3DPatch
 
             var dc = devices.DeviceContext;
             var frame = new CapturedFrame();
+            bool frameProcessed = false;
 
-            // ── D3D11 の状態を必ず保存 ──
-            using (new D3D11StateSaver(devices.D3D.DeviceContext))
+            try
             {
-                foreach (object pair in (IEnumerable)resources)
+                // ── D3D11 の状態を必ず保存 ──
+                using (new D3D11StateSaver(devices.D3D.DeviceContext))
                 {
-                    var key = _kvpKeyProp!.GetValue(pair) as IVideoItem;
-                    var value = _kvpValueProp!.GetValue(pair);
-                    if (key == null || value == null) continue;
-
-                    var esoList = _effectedSourceOutputsField!.GetValue(value) as IList;
-                    if (esoList == null || esoList.Count == 0) continue;
-
-                    foreach (object? eso in esoList)
+                    foreach (object pair in (IEnumerable)resources)
                     {
-                        if (eso == null) continue;
+                        var key = _kvpKeyProp!.GetValue(pair) as IVideoItem;
+                        var value = _kvpValueProp!.GetValue(pair);
+                        if (key == null || value == null) continue;
 
-                        var preRenderOutput = _esoPreRenderOutputProp!.GetValue(eso) as ID2D1Image;
-                        var drawDesc = _esoDrawDescProp!.GetValue(eso) as DrawDescription;
+                        var esoList = _effectedSourceOutputsField!.GetValue(value) as IList;
+                        if (esoList == null || esoList.Count == 0) continue;
 
-                        if (preRenderOutput == null || drawDesc == null) continue;
-
-                        if ((double)drawDesc.Zoom.X == 0.0 || (double)drawDesc.Zoom.Y == 0.0 || drawDesc.Opacity == 0.0) continue;
-
-                        RawRectF bounds;
-                        try { bounds = dc.GetImageLocalBounds(preRenderOutput); }
-                        catch { continue; }
-
-                        int left = (int)MathF.Floor(bounds.Left);
-                        int top = (int)MathF.Floor(bounds.Top);
-                        int right = (int)MathF.Ceiling(bounds.Right);
-                        int bottom = (int)MathF.Ceiling(bounds.Bottom);
-
-                        float pw = right - left;
-                        float ph = bottom - top;
-                        if (pw <= 0 || ph <= 0) continue;
-
-                        const int MaxTexSize = 4096;
-                        int texW = Math.Min((int)pw, MaxTexSize);
-                        int texH = Math.Min((int)ph, MaxTexSize);
-                        if (texW <= 0 || texH <= 0) continue;
-
-                        var d3dTex = D2DD3DBridge.BakeToD3DTexture(preRenderOutput, devices, texW, texH, -left, -top);
-                        if (d3dTex == null) continue;
-
-                        using var dxgiResource = d3dTex.QueryInterface<Vortice.DXGI.IDXGIResource>();
-                        if (dxgiResource == null)
+                        foreach (object? eso in esoList)
                         {
-                            d3dTex.Dispose();
-                            continue;
+                            if (eso == null) continue;
+
+                            var preRenderOutput = _esoPreRenderOutputProp!.GetValue(eso) as ID2D1Image;
+                            var drawDesc = _esoDrawDescProp!.GetValue(eso) as DrawDescription;
+
+                            if (preRenderOutput == null || drawDesc == null) continue;
+
+                            if ((double)drawDesc.Zoom.X == 0.0 || (double)drawDesc.Zoom.Y == 0.0 || drawDesc.Opacity == 0.0) continue;
+
+                            RawRectF bounds;
+                            try { bounds = dc.GetImageLocalBounds(preRenderOutput); }
+                            catch { continue; }
+
+                            int left = (int)MathF.Floor(bounds.Left);
+                            int top = (int)MathF.Floor(bounds.Top);
+                            int right = (int)MathF.Ceiling(bounds.Right);
+                            int bottom = (int)MathF.Ceiling(bounds.Bottom);
+
+                            float pw = right - left;
+                            float ph = bottom - top;
+                            if (pw <= 0 || ph <= 0) continue;
+
+                            const int MaxTexSize = 4096;
+                            int texW = Math.Min((int)pw, MaxTexSize);
+                            int texH = Math.Min((int)ph, MaxTexSize);
+                            if (texW <= 0 || texH <= 0) continue;
+
+                            var d3dTex = D2DD3DBridge.BakeToD3DTexture(preRenderOutput, devices, texW, texH, -left, -top);
+                            if (d3dTex == null) continue;
+
+                            try
+                            {
+                                using var dxgiResource = d3dTex.QueryInterface<Vortice.DXGI.IDXGIResource>();
+                                if (dxgiResource == null)
+                                {
+                                    d3dTex.Dispose();
+                                    continue;
+                                }
+
+                                float cx = left + texW / 2f;
+                                float cy = top + texH / 2f;
+
+                                frame.Items.Add(new CapturedItem
+                                {
+                                    DrawDescription = drawDesc,
+                                    Texture = d3dTex,
+                                    SharedHandle = dxgiResource.SharedHandle,
+                                    PixelWidth = texW,
+                                    PixelHeight = texH,
+                                    BoundsCenterX = cx,
+                                    BoundsCenterY = cy,
+                                    Opacity = (float)drawDesc.Opacity,
+                                    Layer = key.Layer,
+                                });
+                            }
+                            catch
+                            {
+                                d3dTex.Dispose();
+                                throw;
+                            }
                         }
-
-                        float cx = left + texW / 2f;
-                        float cy = top + texH / 2f;
-
-                        frame.Items.Add(new CapturedItem
-                        {
-                            DrawDescription = drawDesc,
-                            Texture = d3dTex,
-                            SharedHandle = dxgiResource.SharedHandle,
-                            PixelWidth = texW,
-                            PixelHeight = texH,
-                            BoundsCenterX = cx,
-                            BoundsCenterY = cy,
-                            Opacity = (float)drawDesc.Opacity,
-                            Layer = key.Layer,
-                        });
                     }
+
+                    lock (_lock)
+                    {
+                        _latestFrame?.Dispose();
+                        _latestFrame = frame;
+                    }
+                    frameProcessed = true;
                 }
             }
-
-            lock (_lock)
+            finally
             {
-                _latestFrame?.Dispose();
-                _latestFrame = frame;
+                if (!frameProcessed)
+                {
+                    frame.Dispose();
+                }
             }
         }
         catch (Exception ex)

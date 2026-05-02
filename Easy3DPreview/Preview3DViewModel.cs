@@ -70,6 +70,8 @@ internal sealed class Preview3DViewModel : INotifyPropertyChanged, ITimelineTool
 
     public Preview3DViewModel()
     {
+        Preview3DPatch.RegisterConsumer();
+
         Camera.Reset();
 
         ResetCommand = new ActionCommand(_ => true, _ =>
@@ -185,6 +187,7 @@ internal sealed class Preview3DViewModel : INotifyPropertyChanged, ITimelineTool
 
     public void Dispose()
     {
+        Preview3DPatch.UnregisterConsumer();
         _timer.Stop();
         foreach (var item in UiItems) item.Dispose();
         UiItems.Clear();
