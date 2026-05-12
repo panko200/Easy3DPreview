@@ -15,6 +15,7 @@ internal sealed class CameraController
     private float _distance = 1000f;                // 注視点からの距離
     private float _yaw = 0f;                        // 水平回転 (ラジアン)
     private float _pitch = 0f;                      // 垂直回転 (ラジアン)
+    private float _roll = 0f;                       // Z回転（ロール） (ラジアン)
 
     // ── 投影 ──
     private bool _isOrthographic = false;
@@ -40,8 +41,6 @@ internal sealed class CameraController
 
     /// <summary>
     /// カメラをデフォルト位置にリセット。
-    /// (0,0,1000) から -Z 方向 (画面奥) を向く。
-    /// YMM4 座標系: Z+ = 手前 なので、Z = 1000 の位置から見ると原点が画面奥にある。
     /// </summary>
     public void Reset()
     {
@@ -49,13 +48,13 @@ internal sealed class CameraController
         _distance = 1000f;
         _yaw = 0f;
         _pitch = 0f;
+        _roll = 0f;
         _orthoScale = 1f;
     }
 
     /// <summary>
     /// マウスホイールによるズーム。
     /// </summary>
-    /// <param name="delta">正=ズームイン, 負=ズームアウト</param>
     public void Zoom(float delta)
     {
         float factor = 1f - delta * 0.001f;
@@ -77,39 +76,45 @@ internal sealed class CameraController
     }
 
     /// <summary>
+    /// 右クリック+中ボタン等によるZ回転（ロール）。
+    /// </summary>
+    public void AddRoll(float deltaAngle)
+    {
+        _roll -= deltaAngle * RotateSensitivity;
+    }
+
+    /// <summary>
     /// 中ボタン+ドラッグによるパン移動。
     /// </summary>
     public void Pan(float deltaX, float deltaY)
     {
-        // カメラの右方向と上方向を求める
         var (right, up, _) = GetCameraAxes();
-
         float scale = _distance * PanSensitivity * 0.001f;
-        // マウスの動きに画面上の物体を追従させる計算
         _target -= right * deltaX * scale;
         _target += up * deltaY * scale;
     }
 
     /// <summary>
-    /// View 行列を計算する（左手系 → System.Numerics は右手系なので手動構築）。
+    /// View 行列を計算する。
     /// </summary>
     public Matrix4x4 GetViewMatrix()
     {
         var eye = CameraPosition;
         var target = _target;
 
-        // YMM4 座標系: Y+ = 下
-        // カメラの forward = target - eye (注視点へ向かう方向)
         var forward = Vector3.Normalize(target - eye);
-
-        // up ベクトル: Y+ = 下 なので (0, -1, 0) を使う
-        // ただし pitch が ±90度付近で不安定にならないよう
         var worldUp = new Vector3(0f, -1f, 0f);
 
         var right = Vector3.Normalize(Vector3.Cross(worldUp, forward));
         var up = Vector3.Cross(forward, right);
 
-        // View 行列を手動構築
+        if (_roll != 0f)
+        {
+            var rollMatrix = Matrix4x4.CreateFromAxisAngle(forward, _roll);
+            right = Vector3.TransformNormal(right, rollMatrix);
+            up = Vector3.TransformNormal(up, rollMatrix);
+        }
+
         var view = new Matrix4x4(
             right.X,   up.X,   forward.X,   0f,
             right.Y,   up.Y,   forward.Y,   0f,
@@ -161,6 +166,14 @@ internal sealed class CameraController
         var worldUp = new Vector3(0f, -1f, 0f);
         var right = Vector3.Normalize(Vector3.Cross(worldUp, forward));
         var up = Vector3.Cross(forward, right);
+
+        if (_roll != 0f)
+        {
+            var rollMatrix = Matrix4x4.CreateFromAxisAngle(forward, _roll);
+            right = Vector3.TransformNormal(right, rollMatrix);
+            up = Vector3.TransformNormal(up, rollMatrix);
+        }
+
         return (right, up, forward);
     }
 

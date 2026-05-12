@@ -22,6 +22,9 @@ public class Preview3DPlugin : IToolPlugin
         {
             var harmony = new HarmonyLib.Harmony("Easy3DPreview.Preview3D");
             Preview3DPatch.Apply(harmony);
+            Preview3DVisibilityJsonPatch.Apply(harmony);
+            Preview3DVisibilityClonePatch.Apply(harmony);
+            Preview3DVisibilityPropertiesEditorPatch.Apply(harmony);
             Log("Harmony パッチ適用完了");
         }
         catch (Exception ex)

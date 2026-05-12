@@ -1,7 +1,6 @@
 using System;
 using System.ComponentModel;
 using System.Windows.Input;
-using System.Windows.Threading;
 using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Plugin;
 using YukkuriMovieMaker.Project;
@@ -12,7 +11,8 @@ namespace Easy3DPreview;
 
 /// <summary>
 /// 3Dプレビュー ツールの ViewModel。
-/// カメラ状態管理、フレーム更新タイマー、コマンドを提供する。
+/// カメラ状態管理、SRVキャッシュ、コマンドを提供する。
+/// 描画ループは View 側 (CompositionTarget.Rendering) が担当。
 /// </summary>
 internal sealed class Preview3DViewModel : INotifyPropertyChanged, ITimelineToolViewModel, IToolViewModel, IDisposable
 {
@@ -21,16 +21,20 @@ internal sealed class Preview3DViewModel : INotifyPropertyChanged, ITimelineTool
     // ── カメラ ──
     public CameraController Camera { get; } = new();
 
-    // ── レンダラー ──
+    // ── レンダラー (シェーダ等の管理のみ、デバイスは D3D11Host が所有) ──
     public Preview3DRenderer Renderer { get; } = new();
 
-    // ── 更新タイマー ──
-    private readonly DispatcherTimer _timer;
-
-    // ── 最新のUI用アイテム ──
+    // ── 最新のUI用アイテム (SRVキャッシュ) ──
     public List<UiItem> UiItems { get; } = new();
     public int VideoWidth { get; private set; } = 1920;
     public int VideoHeight { get; private set; } = 1080;
+
+    // ── 前フレームを保持: SRV が参照する SharedHandle の元テクスチャを生かしておく ──
+    private CapturedFrame? _lastFrame;
+
+    // ── SRVキャッシュ: 新しいフレームが来るまで再利用 ──
+    private bool _srvDirty = false;
+    public bool HasNewFrame => _srvDirty;
 
     // ── UI プロパティ ──
     private string _projectionLabel = "透視投影";
@@ -65,36 +69,21 @@ internal sealed class Preview3DViewModel : INotifyPropertyChanged, ITimelineTool
     public ICommand ResetCommand { get; }
     public ICommand ToggleProjectionCommand { get; }
 
-    // ── 更新通知 ──
-    public event Action? FrameUpdated;
-
     public Preview3DViewModel()
     {
-        Preview3DPatch.RegisterConsumer();
-
         Camera.Reset();
 
         ResetCommand = new ActionCommand(_ => true, _ =>
         {
             Camera.Reset();
             OnPropertyChanged(nameof(Camera));
-            RequestRender();
         });
 
         ToggleProjectionCommand = new ActionCommand(_ => true, _ =>
         {
             Camera.IsOrthographic = !Camera.IsOrthographic;
             ProjectionLabel = Camera.IsOrthographic ? "平行投影" : "透視投影";
-            RequestRender();
         });
-
-        // 60fps で更新チェック
-        _timer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromMilliseconds(16),
-        };
-        _timer.Tick += OnTimerTick;
-        _timer.Start();
     }
 
     public void SetTimelineToolInfo(TimelineToolInfo info)
@@ -102,71 +91,86 @@ internal sealed class Preview3DViewModel : INotifyPropertyChanged, ITimelineTool
         _timeline = info.Timeline;
     }
 
-    private void OnTimerTick(object? sender, EventArgs e)
+    /// <summary>
+    /// 新しいフレームが利用可能か確認し、SRV を更新する。
+    /// CompositionTarget.Rendering から毎フレーム呼び出される。
+    /// </summary>
+    public void UpdateFromCapturedFrame(Vortice.Direct3D11.ID3D11Device? d3dDevice)
     {
-        // Harmony パッチからキャプチャされた最新フレームを取得
         var newFrame = Preview3DPatch.TakeLatestFrame();
-        if (newFrame != null)
+        if (newFrame == null) return; // 新フレームなし → キャッシュ済み SRV をそのまま使用
+
+        // 古い UI アイテムを破棄
+        foreach (var item in UiItems) item.Dispose();
+        UiItems.Clear();
+
+        VideoWidth = 1920;
+        VideoHeight = 1080;
+
+        if (d3dDevice != null)
         {
-            // 古い UI アイテムを破棄
-            foreach (var item in UiItems) item.Dispose();
-            UiItems.Clear();
-
-            VideoWidth = 1920;
-            VideoHeight = 1080; // Defaulting sizes here
-
-            var d3dDevice = Renderer.Device;
-            if (d3dDevice != null)
+            foreach (var item in newFrame.Items)
             {
-                foreach (var item in newFrame.Items)
+                if (item.Texture == null) continue;
+                try
                 {
-                    if (item.SharedHandle == IntPtr.Zero) continue;
-                    try
+                    Vortice.Direct3D11.ID3D11ShaderResourceView? srv;
+
+                    if (item.IsOnIndependentDevice)
                     {
-                        using var sharedTex = d3dDevice.OpenSharedResource<Vortice.Direct3D11.ID3D11Texture2D>(item.SharedHandle);
-                        if (sharedTex != null)
-                        {
-                            var srv = D2DD3DBridge.CreateSrv(sharedTex, d3dDevice);
-                            if (srv != null)
-                            {
-                                UiItems.Add(new UiItem
-                                {
-                                    DrawDescription = item.DrawDescription,
-                                    Srv = srv,
-                                    PixelWidth = item.PixelWidth,
-                                    PixelHeight = item.PixelHeight,
-                                    BoundsCenterX = item.BoundsCenterX,
-                                    BoundsCenterY = item.BoundsCenterY,
-                                    Opacity = item.Opacity,
-                                    Layer = item.Layer,
-                                });
-                            }
-                        }
+                        // YMM43D方式: テクスチャが独立デバイス上 → 直接SRV作成
+                        srv = D2DD3DBridge.CreateSrv(item.Texture, d3dDevice);
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        Preview3DPlugin.Log($"OpenSharedResource エラー: {ex.Message}");
+                        // 旧方式: SharedHandle経由
+                        using var dxgiRes = item.Texture.QueryInterface<Vortice.DXGI.IDXGIResource>();
+                        if (dxgiRes == null) continue;
+                        using var sharedTex = d3dDevice.OpenSharedResource<Vortice.Direct3D11.ID3D11Texture2D>(dxgiRes.SharedHandle);
+                        srv = sharedTex != null ? D2DD3DBridge.CreateSrv(sharedTex, d3dDevice) : null;
+                    }
+
+                    if (srv != null)
+                    {
+                        UiItems.Add(new UiItem
+                        {
+                            DrawDescription = item.DrawDescription,
+                            Srv = srv,
+                            PixelWidth = item.PixelWidth,
+                            PixelHeight = item.PixelHeight,
+                            BoundsCenterX = item.BoundsCenterX,
+                            BoundsCenterY = item.BoundsCenterY,
+                            Opacity = item.Opacity,
+                            Layer = item.Layer,
+                            D3DEffectId = item.D3DEffectId,
+                            D3DVideoEffect = item.D3DVideoEffect,
+                            ItemFrame = item.ItemFrame,
+                            ItemLength = item.ItemLength,
+                            Fps = item.Fps,
+                        });
                     }
                 }
+                catch (Exception ex)
+                {
+                    Preview3DPlugin.Log($"SRV作成エラー: {ex.Message}");
+                }
             }
-
-            // 元のフレーム（YMM4側テクスチャ）を解放
-            newFrame.Dispose();
-
-            StatusText = UiItems.Count > 0
-                ? $"アイテム数: {UiItems.Count}"
-                : "アイテムなし";
         }
 
-        // カメラがUIから操作されたときなど、常に再描画する
-        RequestRender();
+        // 前フレームのテクスチャを破棄し、現フレームを保持
+        // SharedHandle 経由の SRV が有効であるため、元テクスチャを生かしておく
+        _lastFrame?.Dispose();
+        _lastFrame = newFrame;
+
+        StatusText = UiItems.Count > 0
+            ? $"アイテム数: {UiItems.Count}"
+            : "アイテムなし";
+
+        _srvDirty = true;
     }
 
-    /// <summary>手動でレンダリングを要求する。</summary>
-    public void RequestRender()
-    {
-        FrameUpdated?.Invoke();
-    }
+    /// <summary>SRV更新済みフラグをクリア</summary>
+    public void ClearDirtyFlag() => _srvDirty = false;
 
     // ── IToolViewModel ──
 
@@ -184,14 +188,16 @@ internal sealed class Preview3DViewModel : INotifyPropertyChanged, ITimelineTool
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
     // ── IDisposable ──
+    public event EventHandler? Disposed;
 
     public void Dispose()
     {
-        Preview3DPatch.UnregisterConsumer();
-        _timer.Stop();
         foreach (var item in UiItems) item.Dispose();
         UiItems.Clear();
+        _lastFrame?.Dispose();
+        _lastFrame = null;
         Renderer.Dispose();
+        Disposed?.Invoke(this, EventArgs.Empty);
     }
 }
 
@@ -205,6 +211,13 @@ internal sealed class UiItem : IDisposable
     public float BoundsCenterY { get; init; }
     public float Opacity { get; init; }
     public int Layer { get; init; }
+
+    // ── D3Dエフェクト情報 ──
+    public string? D3DEffectId { get; init; }
+    public object? D3DVideoEffect { get; init; }
+    public long ItemFrame { get; init; }
+    public long ItemLength { get; init; }
+    public int Fps { get; init; }
 
     public void Dispose()
     {

@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -45,15 +47,8 @@ internal sealed class Preview3DRenderer : IDisposable
         public float _pad2;             // 4  → 合計 80 bytes
     }
 
+    // デバイスは外部 (D3D11Host) から受け取る
     private ID3D11Device? _d3d;
-    private ID3D11DeviceContext? _ctx;
-
-    // ── レンダーターゲット ──
-    private ID3D11RenderTargetView? _rtv;
-    private ID3D11Texture2D? _renderTarget;
-    private ID3D11Texture2D? _stagingTexture;
-    private ID3D11DepthStencilView? _dsv;
-    private ID3D11Texture2D? _depthStencil;
 
     // ── シェーダ/パイプライン ──
     private ID3D11VertexShader? _vs;
@@ -73,10 +68,11 @@ internal sealed class Preview3DRenderer : IDisposable
     private ID3D11VertexShader? _gridVs;
     private ID3D11PixelShader? _gridPs;
 
-    private int _width;
-    private int _height;
     private bool _initialized;
     private bool _disposed;
+
+    // ── D3Dエフェクト (リフレクション経由) ──
+    private readonly D3DEffectHelper _effectHelper = new();
 
     // ═══════════════════════════════════════════════════
     // シェーダソース
@@ -156,74 +152,25 @@ float4 PS_Grid(PSInput input) : SV_Target
 
     public ID3D11Device? Device => _d3d;
 
-    public bool Initialize(int width, int height)
+    /// <summary>
+    /// 外部デバイスでシェーダ等を初期化する。
+    /// D3D11Host のデバイス作成後に一度だけ呼ぶ。
+    /// </summary>
+    public bool Initialize(ID3D11Device device)
     {
-        if (_initialized && _width == width && _height == height) return true;
+        if (_initialized && _d3d == device) return true;
 
-        if (_d3d == null)
-        {
-            var flags = Vortice.Direct3D11.DeviceCreationFlags.BgraSupport;
-            // 独立した D3D11 デバイスを作成
-            if (Vortice.Direct3D11.D3D11.D3D11CreateDevice(
-                null,
-                Vortice.Direct3D.DriverType.Hardware,
-                flags,
-                null,
-                out _d3d,
-                out _ctx).Failure)
-            {
-                return false;
-            }
-        }
+        Dispose(); // Clean up old resources if any
+        _disposed = false;
+        _initialized = false;
 
-        DisposeTargets();
-        _width = width;
-        _height = height;
+        _d3d = device;
 
         try
         {
-            // レンダーターゲット
-            _renderTarget = _d3d.CreateTexture2D(new Texture2DDescription
-            {
-                Width = width, Height = height,
-                MipLevels = 1, ArraySize = 1,
-                Format = Format.B8G8R8A8_UNorm,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
-            });
-            _rtv = _d3d.CreateRenderTargetView(_renderTarget);
-
-            // CPU読み出し用ステージングテクスチャ
-            _stagingTexture = _d3d.CreateTexture2D(new Texture2DDescription
-            {
-                Width = width, Height = height,
-                MipLevels = 1, ArraySize = 1,
-                Format = Format.B8G8R8A8_UNorm,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Staging,
-                BindFlags = BindFlags.None,
-                CPUAccessFlags = CpuAccessFlags.Read,
-            });
-
-            // 深度バッファ
-            _depthStencil = _d3d.CreateTexture2D(new Texture2DDescription
-            {
-                Width = width, Height = height,
-                MipLevels = 1, ArraySize = 1,
-                Format = Format.D24_UNorm_S8_UInt,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.DepthStencil,
-            });
-            _dsv = _d3d.CreateDepthStencilView(_depthStencil);
-
-            if (!_initialized)
-            {
-                if (!InitializeShaders()) return false;
-                if (!InitializeStates()) return false;
-                InitializeGeometry();
-            }
+            if (!InitializeShaders()) return false;
+            if (!InitializeStates()) return false;
+            InitializeGeometry();
 
             _initialized = true;
             return true;
@@ -399,11 +346,20 @@ float4 PS_Grid(PSInput input) : SV_Target
     /// <summary>
     /// キャプチャされたアイテムを独自カメラで描画し、結果テクスチャを返す。
     /// </summary>
-    public ID3D11Texture2D? Render(List<UiItem> items, CameraController camera, int screenWidth, int screenHeight)
+    /// <summary>
+    /// 外部の RTV/DSV に描画する。D3D11Host の SwapChain バックバッファを想定。
+    /// </summary>
+    public void Render(
+        ID3D11DeviceContext ctx,
+        ID3D11RenderTargetView rtv,
+        ID3D11DepthStencilView dsv,
+        int width, int height,
+        List<UiItem> items, CameraController camera,
+        int screenWidth, int screenHeight)
     {
-        if (!_initialized || _rtv == null || _dsv == null || _ctx == null) return null;
+        if (!_initialized || _d3d == null) return;
 
-        float aspectRatio = (float)_width / _height;
+        float aspectRatio = (float)width / height;
         var viewMatrix = camera.GetViewMatrix();
         var projMatrix = camera.GetProjectionMatrix(aspectRatio);
         var viewProj = viewMatrix * projMatrix;
@@ -411,16 +367,16 @@ float4 PS_Grid(PSInput input) : SV_Target
         try
         {
             // クリア (ダークグレー背景)
-            _ctx.ClearRenderTargetView(_rtv!, new Color4(0.15f, 0.15f, 0.18f, 1f));
-            _ctx.ClearDepthStencilView(_dsv!, DepthStencilClearFlags.Depth, 1.0f, 0);
+            ctx.ClearRenderTargetView(rtv, new Color4(0.15f, 0.15f, 0.18f, 1f));
+            ctx.ClearDepthStencilView(dsv, DepthStencilClearFlags.Depth, 1.0f, 0);
 
-            _ctx.RSSetViewport(new Viewport(0, 0, _width, _height, 0f, 1f));
-            _ctx.RSSetState(_rasterizerState);
-            _ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
+            ctx.RSSetViewport(new Viewport(0, 0, width, height, 0f, 1f));
+            ctx.RSSetState(_rasterizerState);
+            ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
 
-            _ctx.OMSetRenderTargets(_rtv!, _dsv);
-            _ctx.OMSetBlendState(_blendState, null, unchecked((int)0xFFFFFFFF));
-            _ctx.OMSetDepthStencilState(_depthState, 0);
+            ctx.OMSetRenderTargets(rtv, dsv);
+            ctx.OMSetBlendState(_blendState, null, unchecked((int)0xFFFFFFFF));
+            ctx.OMSetDepthStencilState(_depthState, 0);
 
             // シーン定数バッファを更新
             var cbScene = new CbScene
@@ -429,137 +385,98 @@ float4 PS_Grid(PSInput input) : SV_Target
                 HalfWidth = screenWidth / 2f,
                 HalfHeight = screenHeight / 2f,
             };
-            _ctx.UpdateSubresource(ref cbScene, _cbScene!);
-            _ctx.VSSetConstantBuffer(0, _cbScene);
-            _ctx.PSSetConstantBuffer(0, _cbScene);
+            ctx.UpdateSubresource(ref cbScene, _cbScene!);
+            ctx.VSSetConstantBuffer(0, _cbScene);
+            ctx.PSSetConstantBuffer(0, _cbScene);
 
             // ── グリッド描画 ──
-            DrawGrid();
+            DrawGrid(ctx);
 
             // ── アイテム描画 ──
-            _ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
-            _ctx.IASetInputLayout(_inputLayout);
-            _ctx.IASetVertexBuffer(0, _vertexBuffer!, Marshal.SizeOf<Vertex>(), 0);
-            _ctx.VSSetShader(_vs);
-            _ctx.PSSetShader(_ps);
-            _ctx.PSSetSampler(0, _sampler);
-
-            _ctx.VSSetConstantBuffer(1, _cbPerObject);
-            _ctx.PSSetConstantBuffer(1, _cbPerObject);
-
             foreach (var item in items)
             {
                 if (item.Srv == null) continue;
 
                 var world = BuildWorldMatrix(item);
+
+                // D3Dエフェクトがある場合はエフェクトで描画
+                if (item.D3DEffectId != null && _effectHelper.IsAvailable)
+                {
+                    try
+                    {
+                        if (_effectHelper.RenderEffect(
+                            ctx, _d3d!, item.Srv, item, world, viewProj, camera.CameraPosition))
+                        {
+                            // エフェクト描画後、パイプライン状態を復元
+                            ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
+                            ctx.IASetInputLayout(_inputLayout);
+                            ctx.IASetVertexBuffer(0, _vertexBuffer!, Marshal.SizeOf<Vertex>(), 0);
+                            ctx.VSSetShader(_vs);
+                            ctx.PSSetShader(_ps);
+                            ctx.PSSetSampler(0, _sampler);
+                            ctx.VSSetConstantBuffer(0, _cbScene);
+                            ctx.PSSetConstantBuffer(0, _cbScene);
+                            ctx.VSSetConstantBuffer(1, _cbPerObject);
+                            ctx.PSSetConstantBuffer(1, _cbPerObject);
+                            ctx.RSSetState(_rasterizerState);
+                            ctx.OMSetBlendState(_blendState, null, unchecked((int)0xFFFFFFFF));
+                            ctx.OMSetDepthStencilState(_depthState, 0);
+                            continue;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Preview3DPlugin.Log($"D3Dエフェクト描画エラー: {ex.Message}");
+                    }
+                }
+
+                // 通常の板ポリ描画
+                ctx.IASetPrimitiveTopology(PrimitiveTopology.TriangleStrip);
+                ctx.IASetInputLayout(_inputLayout);
+                ctx.IASetVertexBuffer(0, _vertexBuffer!, Marshal.SizeOf<Vertex>(), 0);
+                ctx.VSSetShader(_vs);
+                ctx.PSSetShader(_ps);
+                ctx.PSSetSampler(0, _sampler);
+                ctx.VSSetConstantBuffer(1, _cbPerObject);
+                ctx.PSSetConstantBuffer(1, _cbPerObject);
+
                 var cbObj = new CbPerObject
                 {
                     WorldMatrix = world,
                     Opacity = item.Opacity,
                 };
-                _ctx.UpdateSubresource(ref cbObj, _cbPerObject!);
-                _ctx.PSSetShaderResource(0, item.Srv);
-                _ctx.Draw(4, 0);
+                ctx.UpdateSubresource(ref cbObj, _cbPerObject!);
+                ctx.PSSetShaderResource(0, item.Srv);
+                ctx.Draw(4, 0);
             }
 
             // レンダーターゲットをアンバインド
-            _ctx.OMSetRenderTargets((ID3D11RenderTargetView?)null, null);
-
-            return _renderTarget;
+            ctx.OMSetRenderTargets((ID3D11RenderTargetView?)null, null);
         }
         catch (Exception ex)
         {
             Preview3DPlugin.Log($"Render エラー: {ex.Message}");
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// レンダリング結果を WriteableBitmap にコピーする。
-    /// Staging Texture を使って CPU 側にピクセルデータを読み出す。
-    /// </summary>
-    public unsafe bool CopyToBitmap(ID3D11Texture2D source, System.Windows.Media.Imaging.WriteableBitmap bitmap)
-    {
-        if (_d3d == null || _ctx == null) return false;
-
-        try
-        {
-            var desc = source.Description;
-            var stagingDesc = new Texture2DDescription
-            {
-                Width = desc.Width,
-                Height = desc.Height,
-                MipLevels = 1,
-                ArraySize = 1,
-                Format = desc.Format,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Staging,
-                BindFlags = BindFlags.None,
-                CPUAccessFlags = CpuAccessFlags.Read,
-                MiscFlags = ResourceOptionFlags.None
-            };
-
-            using var stagingTex = _d3d.CreateTexture2D(stagingDesc);
-            _ctx.CopyResource(stagingTex, source);
-
-            var mapped = _ctx.Map(stagingTex, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
-            try
-            {
-                int bufferSize = desc.Width * desc.Height * 4;
-                bitmap.Lock();
-                try
-                {
-                    if (mapped.RowPitch == desc.Width * 4)
-                    {
-                        System.Buffer.MemoryCopy((void*)mapped.DataPointer, (void*)bitmap.BackBuffer, bufferSize, bufferSize);
-                    }
-                    else
-                    {
-                        for (int y = 0; y < desc.Height; y++)
-                        {
-                            IntPtr srcPtr = mapped.DataPointer + y * mapped.RowPitch;
-                            IntPtr dstPtr = bitmap.BackBuffer + y * desc.Width * 4;
-                            System.Buffer.MemoryCopy((void*)srcPtr, (void*)dstPtr, desc.Width * 4, desc.Width * 4);
-                        }
-                    }
-                    bitmap.AddDirtyRect(new System.Windows.Int32Rect(0, 0, desc.Width, desc.Height));
-                }
-                finally
-                {
-                    bitmap.Unlock();
-                }
-            }
-            finally
-            {
-                _ctx.Unmap(stagingTex, 0);
-            }
-
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Preview3DPlugin.Log($"CopyToBitmap エラー: {ex.Message}");
-            return false;
         }
     }
 
 
-
-    private void DrawGrid()
+    private void DrawGrid(ID3D11DeviceContext ctx)
     {
-        if (_gridVertexBuffer == null || _gridVs == null || _gridPs == null || _ctx == null) return;
+        if (_gridVertexBuffer == null || _gridVs == null || _gridPs == null) return;
 
-        _ctx.IASetPrimitiveTopology(PrimitiveTopology.LineList);
-        _ctx.IASetInputLayout(_inputLayout);
-        _ctx.IASetVertexBuffer(0, _gridVertexBuffer, Marshal.SizeOf<Vertex>(), 0);
-        _ctx.VSSetShader(_gridVs);
-        _ctx.PSSetShader(_gridPs);
-        _ctx.Draw(_gridVertexCount, 0);
+        ctx.IASetPrimitiveTopology(PrimitiveTopology.LineList);
+        ctx.IASetInputLayout(_inputLayout);
+        ctx.IASetVertexBuffer(0, _gridVertexBuffer, Marshal.SizeOf<Vertex>(), 0);
+        ctx.VSSetShader(_gridVs);
+        ctx.PSSetShader(_gridPs);
+        ctx.Draw(_gridVertexCount, 0);
     }
 
     /// <summary>
     /// YMM4 の DrawDescription からワールド行列を構築。
-    /// Iyahon の BuildWorldMatrix と同じロジック（ただし d2dProj は除く）。
+    /// 3Dプレビューでは独自のカメラ (ViewProj) を使うため、
+    /// YMM4 の Camera 行列と d2dProj は含めない。
+    /// アイテム自身の座標・回転・拡大のみでワールド位置を決定する。
     /// </summary>
     private Matrix4x4 BuildWorldMatrix(UiItem item)
     {
@@ -578,19 +495,11 @@ float4 PS_Grid(PSInput input) : SV_Target
         var Ry = Matrix4x4.CreateRotationY(d2r * -(float)desc.Rotation.Y);
         var Rx = Matrix4x4.CreateRotationX(d2r * -(float)desc.Rotation.X);
         var Tdraw = Matrix4x4.CreateTranslation(desc.Draw);
-        var cam = desc.Camera;
 
-        // YMM4 内部の d2dProj は除外（独自の ViewProj を使うため）
-        // ただしカメラ行列は YMM4 が設定したものをそのまま適用
-        return S * Toffset * Zoom * Rz * Ry * Rx * Tdraw * cam;
-    }
-
-    private void DisposeTargets()
-    {
-        _rtv?.Dispose(); _rtv = null;
-        _dsv?.Dispose(); _dsv = null;
-        _depthStencil?.Dispose(); _depthStencil = null;
-        _stagingTexture?.Dispose(); _stagingTexture = null;
+        // Camera 行列と d2dProj は除外:
+        // - d2dProj: YMM4 内部の疑似3D投影 → 3Dプレビューは独自 ViewProj を使用
+        // - Camera: YMM4 のカメラエフェクト → 3Dプレビューではアイテム位置に影響させない
+        return S * Toffset * Zoom * Rz * Ry * Rx * Tdraw;
     }
 
     public void Dispose()
@@ -598,11 +507,8 @@ float4 PS_Grid(PSInput input) : SV_Target
         if (_disposed) return;
         _disposed = true;
 
-        DisposeTargets();
-        _renderTarget?.Dispose();
-        _ctx?.Dispose();
-        _ctx = null;
-        _d3d?.Dispose();
+        _effectHelper.Dispose();
+        // デバイスは D3D11Host が所有するので Dispose しない
         _d3d = null;
         _vs?.Dispose();
         _ps?.Dispose();
@@ -617,5 +523,149 @@ float4 PS_Grid(PSInput input) : SV_Target
         _blendState?.Dispose();
         _depthState?.Dispose();
         _rasterizerState?.Dispose();
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // D3Dエフェクト リフレクションヘルパー
+    // ═══════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Iyahon_D3D11Renderer_Core の D3DEffectRegistry / ID3DEffect / D3DRenderContext を
+    /// リフレクション経由で呼び出すヘルパー。コンパイル時依存なし。
+    /// </summary>
+    private sealed class D3DEffectHelper : IDisposable
+    {
+        private bool _searched;
+        private bool _available;
+
+        // D3DEffectRegistry
+        private MethodInfo? _createEffectMethod;
+
+        // ID3DEffect
+        private MethodInfo? _effectInitializeMethod;
+        private MethodInfo? _effectRenderMethod;
+        private MethodInfo? _effectDisposeMethod;
+
+        // D3DRenderContext
+        private Type? _renderContextType;
+
+        // ID3DVideoEffect
+        private MethodInfo? _configureEffectMethod;
+
+        // エフェクトキャッシュ (effectId -> instance)
+        private readonly Dictionary<string, object> _effectCache = new();
+
+        public bool IsAvailable
+        {
+            get
+            {
+                EnsureSearched();
+                return _available;
+            }
+        }
+
+        private void EnsureSearched()
+        {
+            if (_searched) return;
+            _searched = true;
+
+            try
+            {
+                var registryType = FindType("Iyahon_D3D11Renderer_Core.D3DEffect.D3DEffectRegistry");
+                var effectType = FindType("Iyahon_D3D11Renderer_Core.D3DEffect.ID3DEffect");
+                _renderContextType = FindType("Iyahon_D3D11Renderer_Core.D3DEffect.D3DRenderContext");
+                var videoEffectType = FindType("Iyahon_D3D11Renderer_Core.D3DEffect.ID3DVideoEffect");
+
+                if (registryType == null || effectType == null || _renderContextType == null)
+                {
+                    Preview3DPlugin.Log("D3DEffectHelper: Iyahon_D3D11Renderer_Core 未検出。");
+                    return;
+                }
+
+                _createEffectMethod = registryType.GetMethod("CreateEffect",
+                    BindingFlags.Static | BindingFlags.Public, null, new[] { typeof(string) }, null);
+
+                _effectInitializeMethod = effectType.GetMethod("Initialize");
+                _effectRenderMethod = effectType.GetMethod("Render");
+                _effectDisposeMethod = typeof(IDisposable).GetMethod("Dispose");
+
+                if (videoEffectType != null)
+                {
+                    _configureEffectMethod = videoEffectType.GetMethod("ConfigureEffect");
+                }
+
+                _available = _createEffectMethod != null &&
+                             _effectInitializeMethod != null &&
+                             _effectRenderMethod != null;
+
+                Preview3DPlugin.Log($"D3DEffectHelper: available={_available}");
+            }
+            catch (Exception ex)
+            {
+                Preview3DPlugin.Log($"D3DEffectHelper 初期化エラー: {ex.Message}");
+            }
+        }
+
+        public bool RenderEffect(
+            ID3D11DeviceContext ctx, ID3D11Device device,
+            ID3D11ShaderResourceView srv, UiItem item,
+            Matrix4x4 worldMatrix, Matrix4x4 viewProj, Vector3 cameraPos)
+        {
+            if (!_available || item.D3DEffectId == null) return false;
+
+            // エフェクトインスタンスを取得またはキャッシュから作成
+            if (!_effectCache.TryGetValue(item.D3DEffectId, out var effect))
+            {
+                effect = _createEffectMethod!.Invoke(null, new object[] { item.D3DEffectId });
+                if (effect == null) return false;
+                _effectCache[item.D3DEffectId] = effect;
+            }
+
+            // Initialize
+            _effectInitializeMethod!.Invoke(effect, new object[] { device, ctx });
+
+            // ConfigureEffect (VideoEffect のパラメータを設定)
+            if (_configureEffectMethod != null && item.D3DVideoEffect != null)
+            {
+                _configureEffectMethod.Invoke(item.D3DVideoEffect,
+                    new object[] { effect, item.ItemFrame, item.ItemLength, item.Fps });
+            }
+
+            // D3DRenderContext を構築
+            var renderContext = Activator.CreateInstance(_renderContextType!);
+            if (renderContext == null) return false;
+
+            var rcType = _renderContextType!;
+            rcType.GetProperty("WorldMatrix")!.SetValue(renderContext, worldMatrix);
+            rcType.GetProperty("ViewProjectionMatrix")!.SetValue(renderContext, viewProj);
+            rcType.GetProperty("CameraWorldPosition")!.SetValue(renderContext, cameraPos);
+            rcType.GetProperty("TextureWidth")!.SetValue(renderContext, (int)item.PixelWidth);
+            rcType.GetProperty("TextureHeight")!.SetValue(renderContext, (int)item.PixelHeight);
+            rcType.GetProperty("HalfScreenWidth")!.SetValue(renderContext, 0f); // 0 = ViewProj mode
+            rcType.GetProperty("HalfScreenHeight")!.SetValue(renderContext, 0f);
+            rcType.GetProperty("Opacity")!.SetValue(renderContext, item.Opacity);
+            rcType.GetProperty("AlphaThreshold")!.SetValue(renderContext, 0.004f);
+            rcType.GetProperty("CameraMatrix")!.SetValue(renderContext, item.DrawDescription.Camera);
+
+            // Render
+            _effectRenderMethod!.Invoke(effect, new object[] { ctx, device, srv, renderContext });
+
+            return true;
+        }
+
+        public void Dispose()
+        {
+            foreach (var effect in _effectCache.Values)
+            {
+                try { _effectDisposeMethod?.Invoke(effect, null); }
+                catch { }
+            }
+            _effectCache.Clear();
+        }
+
+        private static Type? FindType(string fullName)
+            => AppDomain.CurrentDomain.GetAssemblies()
+                .SelectMany(a => { try { return a.GetTypes(); } catch { return Array.Empty<Type>(); } })
+                .FirstOrDefault(t => t.FullName == fullName);
     }
 }

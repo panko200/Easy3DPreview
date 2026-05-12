@@ -1,23 +1,22 @@
 using System;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Media.Imaging;
+using Vortice.Direct3D11;
 
 #nullable enable
 namespace Easy3DPreview;
 
 /// <summary>
 /// 3Dプレビュー コントロール。
-/// WriteableBitmap で D3D11 のレンダリング結果を表示し、
-/// マウスイベントでカメラを操作する。
+/// D3D11Host (HwndHost + SwapChain) で D3D11 のレンダリング結果を直接表示し、
+/// CompositionTarget.Rendering でフレームループを駆動する。
+/// GPU→CPU コピーは一切行わない。
 /// </summary>
 public partial class Preview3DControl : UserControl
 {
-    private WriteableBitmap? _bitmap;
-    private int _lastRenderWidth;
-    private int _lastRenderHeight;
+    private D3D11Host? _d3dHost;
+    private bool _hostInitialized;
 
     private Point _lastMousePos;
     private bool _isRightDragging;
@@ -28,131 +27,173 @@ public partial class Preview3DControl : UserControl
         InitializeComponent();
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
+        DataContextChanged += OnDataContextChanged;
+    }
+
+    private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (e.OldValue is Preview3DViewModel oldVm)
+        {
+            oldVm.Disposed -= OnViewModelDisposed;
+        }
+        if (e.NewValue is Preview3DViewModel newVm)
+        {
+            newVm.Disposed += OnViewModelDisposed;
+        }
+    }
+
+    private void OnViewModelDisposed(object? sender, EventArgs e)
+    {
+        DisposeHost();
     }
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        if (DataContext is Preview3DViewModel vm)
+        // D3D11Host を動的に作成してコンテナに追加
+        if (_d3dHost == null)
         {
-            vm.FrameUpdated += OnFrameUpdated;
+            _d3dHost = new D3D11Host();
+            _d3dHost.Render += OnRender;
+            _d3dHost.MouseAction += OnMouseAction;
+            PreviewBorder.Child = _d3dHost;
         }
+
+        CompositionTarget.Rendering += OnRendering;
     }
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
+        CompositionTarget.Rendering -= OnRendering;
+
+        // ViewModel のリソース解放
         if (DataContext is Preview3DViewModel vm)
         {
-            vm.FrameUpdated -= OnFrameUpdated;
+            vm.Dispose();
+        }
+
+        DisposeHost();
+    }
+
+    private void DisposeHost()
+    {
+        // Patch の独立デバイス参照をクリア、未消費フレームを破棄
+        Preview3DPatch.SetIndependentDevice(null);
+        Preview3DPatch.ClearLatestFrame();
+
+        if (_d3dHost != null)
+        {
+            _d3dHost.Render -= OnRender;
+            _d3dHost.MouseAction -= OnMouseAction;
+            PreviewBorder.Child = null;
+            _d3dHost.Dispose();
+            _d3dHost = null;
+            _hostInitialized = false;
         }
     }
 
-    private void OnFrameUpdated()
+    /// <summary>
+    /// WPF の VSync に同期した描画ループ。
+    /// 毎フレーム呼ばれ、新しいキャプチャデータがあれば SRV を更新し、
+    /// 常に SwapChain に描画 → Present する。
+    /// </summary>
+    private void OnRendering(object? sender, EventArgs e)
     {
-        if (DataContext is not Preview3DViewModel vm) return;
+        if (_d3dHost == null) return;
 
-        try
+        // 初回: デバイス初期化
+        if (!_hostInitialized)
         {
-            // レンダラーから独立したD3Dデバイス・コンテキストを使用する
-            // 描画サイズ
-            int rw = Math.Max(1, (int)ActualWidth);
-            int rh = Math.Max(1, (int)ActualHeight);
-            rw = Math.Min(rw, 1920);
-            rh = Math.Min(rh, 1080);
-
-            if (!vm.Renderer.Initialize(rw, rh)) return;
-
-            // 描画
-            var tex = vm.Renderer.Render(vm.UiItems, vm.Camera, vm.VideoWidth, vm.VideoHeight);
-            if (tex == null) return;
-
-            EnsureBitmap(rw, rh);
-            if (_bitmap == null) return;
-
-            if (vm.Renderer.CopyToBitmap(tex, _bitmap))
+            _d3dHost.InitializeDevice();
+            if (_d3dHost.Device != null && DataContext is Preview3DViewModel vm)
             {
-                if (PreviewImage.Source != _bitmap)
-                {
-                    PreviewImage.Source = _bitmap;
-                }
+                vm.Renderer.Initialize(_d3dHost.Device);
+                // Patch に独立デバイスを設定 (YMM43D方式のテクスチャ作成用)
+                Preview3DPatch.SetIndependentDevice(_d3dHost.Device);
             }
+            _hostInitialized = true;
         }
-        catch (Exception ex)
+
+        // ViewModel からキャプチャデータを取得・SRV更新
+        if (DataContext is Preview3DViewModel vm2 && _d3dHost.Device != null)
         {
-            Preview3DPlugin.Log($"OnFrameUpdated エラー: {ex.Message}");
+            vm2.UpdateFromCapturedFrame(_d3dHost.Device);
         }
+
+        // 描画 (SwapChain の Present を含む)
+        _d3dHost.RenderFrame();
     }
 
-    private void EnsureBitmap(int width, int height)
+    /// <summary>
+    /// D3D11Host の Render イベントハンドラ。
+    /// SwapChain のバックバッファに直接描画する。
+    /// </summary>
+    private void OnRender(ID3D11DeviceContext ctx, int width, int height)
     {
-        if (_bitmap != null && _lastRenderWidth == width && _lastRenderHeight == height) return;
-
-        _bitmap = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgra32, null);
-        _lastRenderWidth = width;
-        _lastRenderHeight = height;
-    }
-
-    // ═══════════════════════════════════════════════════
-    // マウスイベントハンドラ
-    // ═══════════════════════════════════════════════════
-
-    private void OnMouseWheel(object sender, MouseWheelEventArgs e)
-    {
-        if (DataContext is Preview3DViewModel vm)
-        {
-            vm.Camera.Zoom(e.Delta);
-            vm.RequestRender();
-        }
-    }
-
-    private void OnMouseDown(object sender, MouseButtonEventArgs e)
-    {
-        _lastMousePos = e.GetPosition(this);
-
-        if (e.RightButton == MouseButtonState.Pressed)
-        {
-            _isRightDragging = true;
-            ((IInputElement)sender).CaptureMouse();
-        }
-        else if (e.MiddleButton == MouseButtonState.Pressed)
-        {
-            _isMiddleDragging = true;
-            ((IInputElement)sender).CaptureMouse();
-        }
-    }
-
-    private void OnMouseMove(object sender, MouseEventArgs e)
-    {
-        if (!_isRightDragging && !_isMiddleDragging) return;
         if (DataContext is not Preview3DViewModel vm) return;
 
-        var pos = e.GetPosition(this);
-        float deltaX = (float)(pos.X - _lastMousePos.X);
-        float deltaY = (float)(pos.Y - _lastMousePos.Y);
-        _lastMousePos = pos;
+        var rtv = _d3dHost?.RenderTargetView;
+        var dsv = _d3dHost?.DepthStencilView;
+        if (rtv == null || dsv == null) return;
 
-        if (_isRightDragging)
-        {
-            vm.Camera.Orbit(deltaX, deltaY);
-        }
-        else if (_isMiddleDragging)
-        {
-            vm.Camera.Pan(deltaX, deltaY);
-        }
-
-        vm.RequestRender();
+        vm.Renderer.Render(
+            ctx, rtv, dsv,
+            width, height,
+            vm.UiItems, vm.Camera,
+            vm.VideoWidth, vm.VideoHeight);
     }
 
-    private void OnMouseUp(object sender, MouseButtonEventArgs e)
+    // ═══════════════════════════════════════════════════
+    // マウスイベントハンドラ (D3D11Host の WndProc 経由)
+    // ═══════════════════════════════════════════════════
+
+    private void OnMouseAction(Point pos, D3D11Host.MouseEventKind kind, int delta)
     {
-        if (e.RightButton == MouseButtonState.Released && _isRightDragging)
+        if (DataContext is not Preview3DViewModel vm) return;
+
+        switch (kind)
         {
-            _isRightDragging = false;
-            ((IInputElement)sender).ReleaseMouseCapture();
-        }
-        if (e.MiddleButton == MouseButtonState.Released && _isMiddleDragging)
-        {
-            _isMiddleDragging = false;
-            ((IInputElement)sender).ReleaseMouseCapture();
+            case D3D11Host.MouseEventKind.RightDown:
+                _lastMousePos = pos;
+                _isRightDragging = true;
+                break;
+            case D3D11Host.MouseEventKind.MiddleDown:
+                _lastMousePos = pos;
+                _isMiddleDragging = true;
+                break;
+            case D3D11Host.MouseEventKind.RightUp:
+                _isRightDragging = false;
+                break;
+            case D3D11Host.MouseEventKind.MiddleUp:
+                _isMiddleDragging = false;
+                break;
+            case D3D11Host.MouseEventKind.Move:
+                float deltaX = (float)(pos.X - _lastMousePos.X);
+                float deltaY = (float)(pos.Y - _lastMousePos.Y);
+                _lastMousePos = pos;
+
+                if (_isRightDragging)
+                {
+                    vm.Camera.Orbit(deltaX, deltaY);
+                }
+                
+                if (_isMiddleDragging)
+                {
+                    vm.Camera.Pan(deltaX, deltaY);
+                }
+                break;
+
+            case D3D11Host.MouseEventKind.Wheel:
+                // Shiftキーが押されている場合はZ回転（ロール）
+                if ((System.Windows.Input.Keyboard.Modifiers & System.Windows.Input.ModifierKeys.Shift) == System.Windows.Input.ModifierKeys.Shift)
+                {
+                    vm.Camera.AddRoll(delta * 0.1f);
+                }
+                else
+                {
+                    // それ以外は常にズーム（右ドラッグ中や中ドラッグ中でも可能）
+                    vm.Camera.Zoom(delta);
+                }
+                break;
         }
     }
 }
