@@ -450,6 +450,23 @@ float4 PS_Grid(PSInput input) : SV_Target
                 ctx.Draw(4, 0);
             }
 
+            // ── 外部アドオン（物理演算オブジェクトやMMDなど）の描画 ──
+            var addons = Easy3DPreviewAPI.Addons;
+            foreach (var addon in addons)
+            {
+                // アドオンごとに状態を退避 → 描画 → 自動復元
+                using var stateSaver = new D3D11StateSaver(ctx);
+                try
+                {
+                    addon.Render(ctx, _d3d!, viewProj, camera.CameraPosition);
+                }
+                catch (Exception ex)
+                {
+                    Preview3DPlugin.Log($"外部アドオン描画エラー ({addon.GetType().Name}): {ex.Message}");
+                }
+                // スコープ終了で stateSaver.Dispose() が走り、全ステートが復元される
+            }
+
             // レンダーターゲットをアンバインド
             ctx.OMSetRenderTargets((ID3D11RenderTargetView?)null, null);
         }

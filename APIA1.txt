@@ -1,0 +1,37 @@
+「簡単3Dプレビュー」前提API仕様書
+
+イヤホンの「簡単3Dプレビュー（Easy3DPreview.dll）」を参照に追加し、以下のインターフェースを実装することで、プレビュー内のカメラ操作や描画ループ（D3D11Host）と同期して独自の描画を行えます。
+
+1. アドオンクラスの実装例
+code C#
+
+using Easy3DPreview;
+using System.Numerics;
+using Vortice.Direct3D11;
+
+public class MyPhysicsAddon : IEasy3DAddon
+{
+    public void Render(ID3D11DeviceContext ctx, ID3D11Device device, Matrix4x4 viewProj, Vector3 cameraPos)
+    {
+        // ここに独自の描画処理（物理オブジェクトやモデルのレンダリング）を記述します。
+        // 描画に必要な D3D11のコンテキスト、独立デバイス、カメラの行列はすべて引数から取得できます。
+    }
+}
+
+2. アドオンの登録と解除
+プラグイン起動時や初期化時に、作成したアドオンクラスを登録します。
+code C#
+
+var myAddon = new MyPhysicsAddon();
+
+// 3Dプレビューの描画ループに登録する
+Easy3DPreviewAPI.RegisterAddon(myAddon);
+
+// 解除する場合
+Easy3DPreviewAPI.UnregisterAddon(myAddon);
+
+3. 共有デバイスの取得
+アドオン初期化時など、あらかじめD3Dデバイスを取得したい場合は以下からアクセス可能です。
+code C#
+
+ID3D11Device? device = Easy3DPreviewAPI.IndependentDevice;
