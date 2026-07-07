@@ -63,6 +63,10 @@ internal static class D2DD3DBridge
             if (result == null) return null;
             var (texture, bitmap) = result.Value;
 
+            // ─── 追加：YMM4側のD3D11コンテキストステートを退避 ───
+            var (_, ymmCtx) = Preview3DPatch.GetYmmD3DExternal(devices);
+            using var stateSaver = ymmCtx != null ? new D3D11StateSaver(ymmCtx) : null;
+
             var dc = devices.DeviceContext;
             var prevTarget = dc.Target;
             try
@@ -98,8 +102,10 @@ internal static class D2DD3DBridge
             // 1. 独立デバイスに共有テクスチャを作成
             var renderTexture = independentDevice.CreateTexture2D(new Texture2DDescription
             {
-                Width = width, Height = height,
-                MipLevels = 1, ArraySize = 1,
+                Width = width,
+                Height = height,
+                MipLevels = 1,
+                ArraySize = 1,
                 Format = Format.B8G8R8A8_UNorm,
                 SampleDescription = new SampleDescription(1, 0),
                 Usage = ResourceUsage.Default,
@@ -113,6 +119,10 @@ internal static class D2DD3DBridge
 
             using var ymmTexture = devices.D3D.Device.OpenSharedResource<ID3D11Texture2D>(sharedHandle);
             using var surface = ymmTexture.QueryInterface<IDXGISurface>();
+
+            // ─── 追加：YMM4側のD3D11コンテキストステートを退避 ───
+            var (_, ymmCtx) = Preview3DPatch.GetYmmD3DExternal(devices);
+            using var stateSaver = ymmCtx != null ? new D3D11StateSaver(ymmCtx) : null;
 
             // 3. YMM4のD2DコンテキストでD2D画像を描画
             var dc = devices.DeviceContext;
@@ -137,8 +147,8 @@ internal static class D2DD3DBridge
                 dc.Target = prevTarget;
             }
 
-            // D2D EndDraw で描画コマンドは発行済み
-            // 共有テクスチャはGPUレベルで同期されるため Flush 不要
+            // usingステートメントを抜ける（stateSaverがDisposeされる）ことで、
+            // D2Dによって変更されたD3D11イミディエイトコンテキストの状態が自動的に元の状態に修復されます。
 
             return renderTexture;
         }

@@ -47,7 +47,16 @@ internal sealed class D3D11StateSaver : IDisposable
         {
             _savedRtvs = new ID3D11RenderTargetView?[1];
             _ctx.OMGetRenderTargets(1, _savedRtvs, out _savedDsv);
-            _savedViewports = _ctx.RSGetViewports<Viewport>();
+            // 最大16個のビューポートを格納できるテンポラリ配列を作成
+            var tempViewports = new Viewport[16];
+            int numViewports = tempViewports.Length; // 16
+
+            // 配列の長さが16なので、Vortice内部の例外チェック（16未満だと落ちる）を安全に回避できます
+            _ctx.RSGetViewports(ref numViewports, tempViewports);
+
+            // 実際に現在設定されていた数（numViewports）の分だけ切り出して退避する
+            _savedViewports = new Viewport[numViewports];
+            Array.Copy(tempViewports, _savedViewports, numViewports);
             _savedRasterizerState = _ctx.RSGetState();
             _ctx.OMGetBlendState(out _savedBlendState, out _savedBlendFactor, out _savedSampleMask);
             _ctx.OMGetDepthStencilState(out _savedDepthStencilState, out _savedStencilRef);

@@ -138,7 +138,9 @@ public partial class Preview3DControl : UserControl
         vm.Renderer.Render(
             ctx, rtv, dsv,
             width, height,
-            vm.UiItems, vm.Camera,
+            vm.UiItems,
+            vm.UiObjModels,   // ★OBJモデルリストを追加
+            vm.Camera,
             vm.VideoWidth, vm.VideoHeight);
     }
 

@@ -59,6 +59,11 @@ A4
 Iyahon_D3D11Renderer_Coreとの連携は変わらずA4です。  
 よくわからないけど他のプラグインとの連携ができるようになったかも。あんまりわからなかったので全部AI任せです。すみません……；；
 
+A5  
+OBJLoaderの3Dモデルに対応。  
+Iyahon_D3D11Rednerer_Coreとの連携はA5とです。  
+少し危険なコードの修正。
+
 ## ライセンス
 
 このプラグインは、以下のライブラリを使用しています。
@@ -67,6 +72,13 @@ Harmony (Lib.Harmony)
 
 - License: MIT License
 - https://github.com/pardeike/Harmony
+
+また、このプラグインはroutersys様制作の、ObjLoaderがあれば、簡単プレビュー内に3Dモデルとして描画します。
+
+ObjLoader
+
+- License: MIT License
+- https://github.com/routersys/YMM4-ObjLoader
 
 本プロジェクトは、MIT License のもと公開しています。  
 [MIT License](./LICENSE)
